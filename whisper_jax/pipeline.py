@@ -14,8 +14,6 @@
 # limitations under the License.
 
 
-import math
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,7 +22,7 @@ from flax import jax_utils
 from flax.core.frozen_dict import freeze
 from flax.training.common_utils import shard
 from jax.sharding import PartitionSpec as P
-from transformers import WhisperProcessor, is_tokenizers_available, WhisperFeatureExtractor, WhisperTokenizerFast
+from transformers import WhisperProcessor, is_tokenizers_available, WhisperTokenizerFast
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE, WhisperTokenizer
 from transformers.pipelines.audio_utils import ffmpeg_read
 from transformers.utils import logging
@@ -254,38 +252,11 @@ class FlaxWhisperPipline:
 
         return forced_decoder_ids
 
-    def chunk_iter_with_batch(self, inputs, chunk_len, stride_left, stride_right, batch_size):
-        inputs_len = inputs.shape[0]
-        step = chunk_len - stride_left - stride_right
+    @staticmethod
+    def _is_batched_input(inputs):
+        return isinstance(inputs, (list, tuple))
 
-        all_chunk_start_idx = np.arange(0, inputs_len, step)
-        num_samples = len(all_chunk_start_idx)
-
-        num_batches = math.ceil(num_samples / batch_size)
-        batch_idx = np.array_split(np.arange(num_samples), num_batches)
-
-        for idx in batch_idx:
-            chunk_start_idx = all_chunk_start_idx[idx]
-            chunk_end_idx = chunk_start_idx + chunk_len
-
-            chunks = [inputs[chunk_start:chunk_end] for chunk_start, chunk_end in zip(chunk_start_idx, chunk_end_idx)]
-            processed = self.feature_extractor(
-                chunks, sampling_rate=self.feature_extractor.sampling_rate, return_tensors="np"
-            )
-
-            _stride_left = np.where(chunk_start_idx == 0, 0, stride_left)
-            is_last = np.where(stride_right > 0, chunk_end_idx > inputs_len, chunk_end_idx >= inputs_len)
-            _stride_right = np.where(is_last, 0, stride_right)
-
-            chunk_lens = [chunk.shape[0] for chunk in chunks]
-            strides = [
-                (chunk_l, _stride_l, _stride_r)
-                for chunk_l, _stride_l, _stride_r in zip(chunk_lens, _stride_left, _stride_right)
-            ]
-
-            yield {"stride": strides, **processed}
-
-    def preprocess_batch(self, inputs, chunk_length_s=30.0, stride_length_s=None, batch_size=None):
+    def _normalize_input(self, inputs):
         if isinstance(inputs, np.ndarray):
             logger.warning(
                 "Numpy array passed as input - no sampling rate checks will be performed."
@@ -336,6 +307,8 @@ class FlaxWhisperPipline:
                 ratio = self.feature_extractor.sampling_rate / in_sampling_rate
             else:
                 ratio = 1
+        else:
+            ratio = 1
 
         if not isinstance(inputs, np.ndarray):
             raise ValueError(f"We expect a numpy ndarray as input, got `{type(inputs)}`")
@@ -352,35 +325,101 @@ class FlaxWhisperPipline:
             # of the original length in the stride so we can cut properly.
             stride = (inputs.shape[0], int(round(stride[0] * ratio)), int(round(stride[1] * ratio)))
 
-        if chunk_length_s:
-            if stride_length_s is None:
-                stride_length_s = chunk_length_s / 6
+        return inputs, stride
 
-            if isinstance(stride_length_s, (int, float)):
-                stride_length_s = [stride_length_s, stride_length_s]
+    def _get_chunking_params(self, chunk_length_s, stride_length_s):
+        if stride_length_s is None:
+            stride_length_s = chunk_length_s / 6
 
-            chunk_len = round(chunk_length_s * self.feature_extractor.sampling_rate)
-            stride_left = round(stride_length_s[0] * self.feature_extractor.sampling_rate)
-            stride_right = round(stride_length_s[1] * self.feature_extractor.sampling_rate)
+        if isinstance(stride_length_s, (int, float)):
+            stride_length_s = [stride_length_s, stride_length_s]
 
-            if chunk_len < stride_left + stride_right:
-                raise ValueError("Chunk length must be superior to stride length")
+        chunk_len = round(chunk_length_s * self.feature_extractor.sampling_rate)
+        stride_left = round(stride_length_s[0] * self.feature_extractor.sampling_rate)
+        stride_right = round(stride_length_s[1] * self.feature_extractor.sampling_rate)
 
-            for item in self.chunk_iter_with_batch(
-                inputs,
-                chunk_len,
-                stride_left,
-                stride_right,
-                batch_size,
-            ):
-                yield item
-        else:
-            processed = self.feature_extractor(
-                inputs, sampling_rate=self.feature_extractor.sampling_rate, return_tensors="np"
+        if chunk_len < stride_left + stride_right:
+            raise ValueError("Chunk length must be superior to stride length")
+
+        return chunk_len, stride_left, stride_right
+
+    def _iterate_chunk_descriptors(self, inputs, chunk_len, stride_left, stride_right):
+        inputs_len = inputs.shape[0]
+        step = chunk_len - stride_left - stride_right
+
+        for chunk_idx, chunk_start_idx in enumerate(np.arange(0, inputs_len, step)):
+            chunk_end_idx = chunk_start_idx + chunk_len
+            chunk = inputs[chunk_start_idx:chunk_end_idx]
+
+            _stride_left = 0 if chunk_start_idx == 0 else stride_left
+            is_last = chunk_end_idx > inputs_len if stride_right > 0 else chunk_end_idx >= inputs_len
+            _stride_right = 0 if is_last else stride_right
+
+            yield {
+                "array": chunk,
+                "chunk_idx": chunk_idx,
+                "stride": (chunk.shape[0], _stride_left, _stride_right),
+            }
+
+    def _pack_chunk_descriptors(self, chunk_descriptors):
+        processed = dict(
+            self.feature_extractor(
+                [descriptor["array"] for descriptor in chunk_descriptors],
+                sampling_rate=self.feature_extractor.sampling_rate,
+                return_tensors="np",
             )
-            if stride is not None:
-                processed["stride"] = stride
-            yield processed
+        )
+        processed["example_idx"] = [descriptor.get("example_idx", 0) for descriptor in chunk_descriptors]
+        processed["chunk_idx"] = [descriptor.get("chunk_idx", idx) for idx, descriptor in enumerate(chunk_descriptors)]
+
+        if any("stride" in descriptor for descriptor in chunk_descriptors):
+            processed["stride"] = [descriptor.get("stride") for descriptor in chunk_descriptors]
+
+        return processed
+
+    def chunk_iter_with_batch(self, inputs, chunk_len, stride_left, stride_right, batch_size):
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        chunk_descriptors = []
+
+        for descriptor in self._iterate_chunk_descriptors(inputs, chunk_len, stride_left, stride_right):
+            chunk_descriptors.append(descriptor)
+            if len(chunk_descriptors) == batch_size:
+                yield self._pack_chunk_descriptors(chunk_descriptors)
+                chunk_descriptors = []
+
+        if chunk_descriptors:
+            yield self._pack_chunk_descriptors(chunk_descriptors)
+
+    def preprocess_batch(self, inputs, chunk_length_s=30.0, stride_length_s=None, batch_size=None):
+        batch_size = batch_size if batch_size is not None else self.batch_size
+        inputs = list(inputs) if self._is_batched_input(inputs) else [inputs]
+
+        chunk_descriptors = []
+        chunk_params = self._get_chunking_params(chunk_length_s, stride_length_s) if chunk_length_s else None
+
+        for example_idx, example in enumerate(inputs):
+            normalized_inputs, stride = self._normalize_input(example)
+
+            if chunk_params is None:
+                descriptor = {"array": normalized_inputs, "example_idx": example_idx, "chunk_idx": 0}
+                if stride is not None:
+                    descriptor["stride"] = stride
+                chunk_descriptors.append(descriptor)
+                if len(chunk_descriptors) == batch_size:
+                    yield self._pack_chunk_descriptors(chunk_descriptors)
+                    chunk_descriptors = []
+                continue
+
+            chunk_len, stride_left, stride_right = chunk_params
+            for descriptor in self._iterate_chunk_descriptors(normalized_inputs, chunk_len, stride_left, stride_right):
+                descriptor["example_idx"] = example_idx
+                chunk_descriptors.append(descriptor)
+                if len(chunk_descriptors) == batch_size:
+                    yield self._pack_chunk_descriptors(chunk_descriptors)
+                    chunk_descriptors = []
+
+        if chunk_descriptors:
+            yield self._pack_chunk_descriptors(chunk_descriptors)
 
     def _decode_model_outputs(self, model_outputs, return_timestamps=None, return_language=None):
         if not model_outputs:
@@ -405,12 +444,25 @@ class FlaxWhisperPipline:
             beam_outputs.append(beam_output)
         return beam_outputs
 
-    def postprocess(self, model_outputs, return_timestamps=None, return_language=None):
-        # unpack the outputs from list(dict(list)) to list(dict)
-        model_outputs = [dict(zip(output, t)) for output in model_outputs for t in zip(*output.values())]
+    def _flatten_model_outputs(self, model_outputs):
+        flattened_outputs = []
+        for output in model_outputs:
+            num_items = output["tokens"].shape[0]
+            for idx in range(num_items):
+                flattened_output = {
+                    "tokens": output["tokens"][idx],
+                    "example_idx": int(output["example_idx"][idx]),
+                    "chunk_idx": int(output["chunk_idx"][idx]),
+                }
+                if "stride" in output and output["stride"][idx] is not None:
+                    flattened_output["stride"] = output["stride"][idx]
+                flattened_outputs.append(flattened_output)
+        return flattened_outputs
 
+    def _postprocess_single(self, model_outputs, return_timestamps=None, return_language=None):
         # Send the chunking back to seconds, it's easier to handle in whisper
         sampling_rate = self.feature_extractor.sampling_rate
+        model_outputs = sorted(model_outputs, key=lambda output: output["chunk_idx"])
         for output in model_outputs:
             if "stride" in output:
                 chunk_len, stride_left, stride_right = output["stride"]
@@ -445,10 +497,30 @@ class FlaxWhisperPipline:
 
         return {**best_result, "beams": beams}
 
+    def postprocess(self, model_outputs, return_timestamps=None, return_language=None, num_examples=1, batched=False):
+        flattened_outputs = self._flatten_model_outputs(model_outputs)
+        grouped_outputs = [[] for _ in range(num_examples)]
+
+        for output in flattened_outputs:
+            grouped_outputs[output["example_idx"]].append(output)
+
+        decoded_outputs = [
+            self._postprocess_single(
+                example_outputs, return_timestamps=return_timestamps, return_language=return_language
+            )
+            for example_outputs in grouped_outputs
+        ]
+
+        if batched:
+            return decoded_outputs
+        return decoded_outputs[0] if decoded_outputs else {"text": ""}
+
     def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False, num_beams=1):
         # We need to keep track of some additional input arguments for post-processing so need to forward these on after running generation
+        model_inputs = dict(model_inputs)
         input_features = model_inputs.pop("input_features")
         input_batch_size = input_features.shape[0]
+        batch_size = batch_size if batch_size is not None else input_batch_size
 
         if input_batch_size != batch_size:
             padding = np.zeros([batch_size - input_batch_size, *input_features.shape[1:]], input_features.dtype)
@@ -460,7 +532,11 @@ class FlaxWhisperPipline:
         if pred_ids.ndim == 2:
             pred_ids = pred_ids[:, None, :]
 
-        out = {"tokens": pred_ids}
+        out = {
+            "tokens": pred_ids,
+            "example_idx": model_inputs.pop("example_idx"),
+            "chunk_idx": model_inputs.pop("chunk_idx"),
+        }
 
         stride = model_inputs.pop("stride", None)
         if stride is not None:
@@ -484,7 +560,7 @@ class FlaxWhisperPipline:
         Transcribe an audio input sequence to a text transcription, optionally with timestamps.
 
         Args:
-            inputs (`np.ndarray` or `bytes` or `str` or `dict`):
+            inputs (`np.ndarray` or `bytes` or `str` or `dict` or `List` of those types):
                 The inputs is either:
                     - `str` that is the filename of the audio file, the file will be read at the correct sampling rate
                       to get the waveform using *ffmpeg*. This requires *ffmpeg* to be installed on the system.
@@ -499,6 +575,8 @@ class FlaxWhisperPipline:
                        ask the pipeline to treat the first `left` samples and last `right` samples to be ignored in
                        decoding (but used at inference to provide more context to the model). In general, this additional
                        stride argument is not required.
+                    - A `List` or `Tuple` of any of the above types. Inputs are packed together into shared forward
+                      passes and one output dictionary is returned per input item.
             chunk_length_s (`float`, *optional*, defaults to 30.0):
                 The input length for each chunk. If `chunk_length_s = 0` then chunking is disabled. By default, the chunk
                 length is set 30.0s, equal to Whisper's context window.
@@ -514,8 +592,9 @@ class FlaxWhisperPipline:
 
                 </Tip>
             batch_size (`int`, *optional*, defaults to the minimum per-device batch size, i.e. `jax.local_device_count()`):
-                The batch size to be used in chunking transcription. Beneficial for transcribing long audio files. Passing
-                a batch size in the `__call__` method will supersede any batch size passed to the `__init__`.
+                The maximum number of packed chunks or examples to include in each forward pass. Beneficial for
+                transcribing long audio files or processing multiple inputs together. Passing a batch size in the
+                `__call__` method will supersede any batch size passed to the `__init__`.
             task (`str`, *optional*):
                 Task to use for generation, either `"transcribe"` or `"translate"`. Defaults to `"transcribe"`.
             language (`str`, *optional*):
@@ -531,21 +610,25 @@ class FlaxWhisperPipline:
                 `num_beams > 1`, the pipeline returns the top beam in `"text"` and all beam hypotheses in `"beams"`.
 
         Return:
-            `Dict`: A dictionary with the following keys:
-                - **text** (`str` ) -- The recognised text.
+            `Dict` or `List[Dict]`: For a single input, returns one dictionary with the following keys:
+                - **text** (`str`) -- The recognised text.
                 - **beams** (*optional*, `List[Dict]`) -- Present when `num_beams > 1`. Each item contains one decoded
                     beam hypothesis in rank order, using the same output structure as the top-level result.
-                - **chunks** (*optional(, `List[Dict]`)
+                - **chunks** (*optional*, `List[Dict]`)
                     When using `return_timestamps`, the `chunks` will become a list containing all the various text
                     chunks identified by the model, *e.g.* `[{"text": "hi ", "timestamps": (0.5,0.9), {"text":
                     "there", "timestamps": (1.0, 1.5)}]`. The original full text can roughly be recovered by doing
                     `"".join(chunk["text"] for chunk in output["chunks"])`.
+                For a batched input, returns a list of dictionaries in the same order as the input sequence.
         """
         batch_size = batch_size if batch_size is not None else self.batch_size
         if batch_size % self.min_batch_size != 0:
             raise ValueError(
                 f"Batch size must be a multiple of the number of JAX devices, but got batch size {batch_size} and num devices {self.min_batch_size}."
             )
+
+        batched_input = self._is_batched_input(inputs)
+        num_examples = len(inputs) if batched_input else 1
 
         dataloader = self.preprocess_batch(
             inputs, chunk_length_s=chunk_length_s, stride_length_s=stride_length_s, batch_size=batch_size
@@ -558,5 +641,10 @@ class FlaxWhisperPipline:
                     batch, batch_size=batch_size, language=language, task=task, return_timestamps=return_timestamps, num_beams=num_beams
                 )
             )
-        post_processed = self.postprocess(model_outputs, return_timestamps=return_timestamps)
+        post_processed = self.postprocess(
+            model_outputs,
+            return_timestamps=return_timestamps,
+            num_examples=num_examples,
+            batched=batched_input,
+        )
         return post_processed
