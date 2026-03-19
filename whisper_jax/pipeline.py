@@ -97,20 +97,21 @@ class FlaxWhisperPipline:
             batch_size if batch_size is not None else self.min_batch_size
         )  # we need a minimum of 1 batch per-device
 
-        def generate(params, input_features, forced_decoder_ids, return_timestamps):
+        def generate(params, input_features, forced_decoder_ids, return_timestamps, num_beams):
             output_ids = self.model.pipeline_generate(
                 input_features,
                 params=params,
                 forced_decoder_ids=forced_decoder_ids,
                 return_timestamps=return_timestamps,
                 max_length=self.max_length,
+                num_beams=num_beams,
             )
             return output_ids
 
         # use pmap for DP by default - this is compatible on a Colab TPU v2
         self.params = jax_utils.replicate(self.params)
         self.p_generate = jax.pmap(
-            generate, "input_features", in_axes=(0, 0, None), out_axes=0, static_broadcasted_argnums=(3,)
+            generate, "input_features", in_axes=(0, 0, None), out_axes=0, static_broadcasted_argnums=(3, 4)
         )
         self.is_sharded = False
 
@@ -163,13 +164,14 @@ class FlaxWhisperPipline:
         self.params = p_shard_params(freeze(jax_utils.unreplicate(self.params)))
         self.is_sharded = True
 
-        def generate(params, input_features, forced_decoder_ids, return_timestamps):
+        def generate(params, input_features, forced_decoder_ids, return_timestamps, num_beams):
             output_ids = self.model.pipeline_generate(
                 input_features,
                 params=params,
                 forced_decoder_ids=forced_decoder_ids,
                 return_timestamps=return_timestamps,
                 max_length=self.max_length,
+                num_beams=num_beams,
             )
             return output_ids
 
@@ -178,23 +180,23 @@ class FlaxWhisperPipline:
             generate,
             in_axis_resources=(params_spec, P("data"), None),
             out_axis_resources=P("data"),
-            static_argnums=(3,),
+            static_argnums=(3, 4),
         )
 
-    def generate(self, input_features, language=None, task=None, return_timestamps=False):
+    def generate(self, input_features, language=None, task=None, return_timestamps=False, num_beams=1):
         forced_decoder_ids = self.get_forced_decoder_ids(
             language=language, task=task, return_timestamps=return_timestamps
         )
         if not self.is_sharded:
             # if we're using pmap we need to manually replicate the input data across devices and gather the output tokens
             output_ids = self.p_generate(
-                freeze(self.params), shard(input_features), forced_decoder_ids, return_timestamps
+                freeze(self.params), shard(input_features), forced_decoder_ids, return_timestamps, num_beams
             ).sequences
             output_ids = jax.device_get(output_ids.reshape(-1, self.max_length))
         else:
             # pjit handles replication / gathering for us auto-magically
             output_ids = self.p_generate(
-                freeze(self.params), input_features, forced_decoder_ids, return_timestamps
+                freeze(self.params), input_features, forced_decoder_ids, return_timestamps, num_beams
             ).sequences
         return output_ids
 
@@ -397,7 +399,7 @@ class FlaxWhisperPipline:
         )
         return {"text": text, **optional}
 
-    def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False):
+    def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False, num_beams=1):
         # We need to keep track of some additional input arguments for post-processing so need to forward these on after running generation
         input_features = model_inputs.pop("input_features")
         input_batch_size = input_features.shape[0]
@@ -406,7 +408,7 @@ class FlaxWhisperPipline:
             padding = np.zeros([batch_size - input_batch_size, *input_features.shape[1:]], input_features.dtype)
             input_features = np.concatenate([input_features, padding])
 
-        pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps)[
+        pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps, num_beams=num_beams)[
             :input_batch_size
         ]
 
@@ -428,6 +430,7 @@ class FlaxWhisperPipline:
         language=None,
         task=None,
         return_timestamps=None,
+        num_beams=1,
         generate_kwargs=None,
     ):
         """
@@ -475,6 +478,9 @@ class FlaxWhisperPipline:
                 Whether to return timestamps in the prediction. Defaults to False. If set to true, the pipeline
                 will return two keys in the output dictionary: `"text"` containing the text transcription, and `"chunks"`
                 containing the transcription segments chunked by their utterance-level timestamps.
+            num_beams (`int`, *optional*, defaults to 1):
+                Number of beams for beam search. 1 means no beam search (greedy decoding). Values greater than 1
+                enable beam search, which can improve transcription quality at the cost of slower inference.
 
         Return:
             `Dict`: A dictionary with the following keys:
@@ -499,7 +505,7 @@ class FlaxWhisperPipline:
         for batch in dataloader:
             model_outputs.append(
                 self.forward(
-                    batch, batch_size=batch_size, language=language, task=task, return_timestamps=return_timestamps
+                    batch, batch_size=batch_size, language=language, task=task, return_timestamps=return_timestamps, num_beams=num_beams
                 )
             )
         post_processed = self.postprocess(model_outputs, return_timestamps=return_timestamps)
