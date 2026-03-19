@@ -53,16 +53,30 @@ logical_axis_rules_dp = (
 class FlaxWhisperPipline:
     def __init__(
         self,
-        checkpoint="openai/whisper-large-v2",
+        checkpoint=None,
         dtype=jnp.float32,
         batch_size=None,
         max_length=None,
+        *,
+        model=None,
+        params=None,
+        processor=None,
+        tokenizer=None,
     ):
         """
         Args
-            checkpoint (`str`, *optional*, defaults to `"openai/whisper-large-v2"):
+            checkpoint (`str`, *optional*):
                 The Whisper checkpoint to use with the pipeline. Must be an available checkpoint on the Hugging Face Hub
-                with Flax weights.
+                with Flax weights. Defaults to `"openai/whisper-large-v2"` when `model` is not provided. When `model`
+                is provided, this is only used to load any missing preprocessing components.
+            model (`FlaxWhisperForConditionalGeneration` or `(model, params)` tuple, *optional*):
+                A preloaded Whisper model to use instead of loading one from `checkpoint`.
+            params (`dict`, *optional*):
+                The parameters for `model`. If omitted, the pipeline falls back to `model.params` when available.
+            processor (`WhisperProcessor`, *optional*):
+                A preloaded processor to use instead of loading one from `checkpoint`.
+            tokenizer (`WhisperTokenizer` or `WhisperTokenizerFast`, *optional*):
+                A preloaded tokenizer to use instead of loading one from `checkpoint`.
             dtype (`jax.numpy.dtype`, *optional*, defaults to `jax.numpy.float32`):
                 The data type of the computation. Can be one of `jax.numpy.float32`, `jax.numpy.float16` (on GPUs) and
                 `jax.numpy.bfloat16` (on TPUs). This can be used to enable half-precision inference on GPUs or TPUs.
@@ -74,20 +88,53 @@ class FlaxWhisperPipline:
             max_length (`int`, *optional*):
                 The maximum numbers of tokens to generate. Defaults to `model.config.max_length`.
         """
-        self.checkpoint = checkpoint
+        if isinstance(model, tuple):
+            if len(model) != 2:
+                raise ValueError("`model` must be a Whisper model or a `(model, params)` tuple.")
+            if params is not None:
+                raise ValueError("Pass model parameters either via `model=(model, params)` or `params=`, not both.")
+            model, params = model
+
+        if checkpoint is None and model is None:
+            checkpoint = "openai/whisper-large-v2"
+
+        inferred_checkpoint = self._infer_checkpoint_from_model(model)
+        self.checkpoint = checkpoint if checkpoint is not None else inferred_checkpoint
         self.dtype = dtype
 
-        self.processor = WhisperProcessor.from_pretrained(self.checkpoint)
+        self.processor = processor
+        if self.processor is None:
+            if self.checkpoint is None:
+                raise ValueError(
+                    "Unable to determine which processor to load. Provide `checkpoint`, `processor`, or a model with checkpoint metadata."
+                )
+            self.processor = WhisperProcessor.from_pretrained(self.checkpoint)
         self.feature_extractor = self.processor.feature_extractor
-        # potentially load fast tokenizer if available
-        tokenizer_cls = WhisperTokenizerFast if is_tokenizers_available() else WhisperTokenizer
-        self.tokenizer = tokenizer_cls.from_pretrained(checkpoint)
+        self.tokenizer = tokenizer if tokenizer is not None else getattr(self.processor, "tokenizer", None)
+        if self.tokenizer is None:
+            if self.checkpoint is None:
+                raise ValueError(
+                    "Unable to determine which tokenizer to load. Provide `checkpoint`, `tokenizer`, or a processor with a tokenizer."
+                )
+            # potentially load fast tokenizer if available
+            tokenizer_cls = WhisperTokenizerFast if is_tokenizers_available() else WhisperTokenizer
+            self.tokenizer = tokenizer_cls.from_pretrained(self.checkpoint)
 
-        self.model, self.params = FlaxWhisperForConditionalGeneration.from_pretrained(
-            self.checkpoint,
-            _do_init=False,
-            dtype=self.dtype,
-        )
+        if model is None:
+            self.model, params = FlaxWhisperForConditionalGeneration.from_pretrained(
+                self.checkpoint,
+                _do_init=False,
+                dtype=self.dtype,
+            )
+        else:
+            self.model = model
+            if params is None:
+                params = getattr(model, "params", None)
+            if params is None:
+                raise ValueError(
+                    "When passing `model`, provide `params` or ensure `model.params` is populated with the inference weights."
+                )
+        self.params = params
 
         self.max_length = max_length if max_length is not None else self.model.generation_config.max_length
         self.min_batch_size = jax.local_device_count()
@@ -113,6 +160,25 @@ class FlaxWhisperPipline:
             generate, "input_features", in_axes=(0, 0, None), out_axes=0, static_broadcasted_argnums=(3, 4)
         )
         self.is_sharded = False
+
+    @staticmethod
+    def _infer_checkpoint_from_model(model):
+        if model is None:
+            return None
+
+        config = getattr(model, "config", None)
+        for owner, attr in (
+            (model, "name_or_path"),
+            (model, "_name_or_path"),
+            (config, "name_or_path"),
+            (config, "_name_or_path"),
+        ):
+            if owner is None:
+                continue
+            value = getattr(owner, attr, None)
+            if value:
+                return value
+        return None
 
     def shard_params(self, num_mp_partitions=1, logical_axis_rules=logical_axis_rules_dp):
         def init_fn():
@@ -648,3 +714,4 @@ class FlaxWhisperPipline:
             batched=batched_input,
         )
         return post_processed
+
