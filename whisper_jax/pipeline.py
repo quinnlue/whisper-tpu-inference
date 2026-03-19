@@ -105,6 +105,7 @@ class FlaxWhisperPipline:
                 return_timestamps=return_timestamps,
                 max_length=self.max_length,
                 num_beams=num_beams,
+                num_return_sequences=num_beams,
             )
             return output_ids
 
@@ -172,6 +173,7 @@ class FlaxWhisperPipline:
                 return_timestamps=return_timestamps,
                 max_length=self.max_length,
                 num_beams=num_beams,
+                num_return_sequences=num_beams,
             )
             return output_ids
 
@@ -187,17 +189,22 @@ class FlaxWhisperPipline:
         forced_decoder_ids = self.get_forced_decoder_ids(
             language=language, task=task, return_timestamps=return_timestamps
         )
+        num_return_sequences = max(1, num_beams)
         if not self.is_sharded:
             # if we're using pmap we need to manually replicate the input data across devices and gather the output tokens
             output_ids = self.p_generate(
                 freeze(self.params), shard(input_features), forced_decoder_ids, return_timestamps, num_beams
             ).sequences
-            output_ids = jax.device_get(output_ids.reshape(-1, self.max_length))
+            output_ids = np.asarray(jax.device_get(output_ids)).reshape(-1, self.max_length)
         else:
             # pjit handles replication / gathering for us auto-magically
             output_ids = self.p_generate(
                 freeze(self.params), input_features, forced_decoder_ids, return_timestamps, num_beams
             ).sequences
+            output_ids = np.asarray(jax.device_get(output_ids)).reshape(-1, self.max_length)
+        output_ids = output_ids.reshape(input_features.shape[0], num_return_sequences, self.max_length)
+        if num_return_sequences == 1:
+            return output_ids[:, 0]
         return output_ids
 
     def get_forced_decoder_ids(self, generation_config=None, task=None, language=None, return_timestamps=False):
@@ -375,11 +382,33 @@ class FlaxWhisperPipline:
                 processed["stride"] = stride
             yield processed
 
+    def _decode_model_outputs(self, model_outputs, return_timestamps=None, return_language=None):
+        if not model_outputs:
+            return {"text": ""}
+
+        time_precision = self.feature_extractor.chunk_length / self.model.config.max_source_positions
+        text, optional = self.tokenizer._decode_asr(
+            model_outputs,
+            return_timestamps=return_timestamps,
+            return_language=return_language,
+            time_precision=time_precision,
+        )
+        return {"text": text, **optional}
+
+    def _select_beam(self, model_outputs, beam_idx):
+        beam_outputs = []
+        for output in model_outputs:
+            beam_output = dict(output)
+            beam_output["tokens"] = output["tokens"][beam_idx : beam_idx + 1]
+            if "token_timestamps" in output:
+                beam_output["token_timestamps"] = output["token_timestamps"][beam_idx : beam_idx + 1]
+            beam_outputs.append(beam_output)
+        return beam_outputs
+
     def postprocess(self, model_outputs, return_timestamps=None, return_language=None):
         # unpack the outputs from list(dict(list)) to list(dict)
         model_outputs = [dict(zip(output, t)) for output in model_outputs for t in zip(*output.values())]
 
-        time_precision = self.feature_extractor.chunk_length / self.model.config.max_source_positions
         # Send the chunking back to seconds, it's easier to handle in whisper
         sampling_rate = self.feature_extractor.sampling_rate
         for output in model_outputs:
@@ -391,13 +420,30 @@ class FlaxWhisperPipline:
                 stride_right /= sampling_rate
                 output["stride"] = chunk_len, stride_left, stride_right
 
-        text, optional = self.tokenizer._decode_asr(
-            model_outputs,
+        best_result = self._decode_model_outputs(
+            self._select_beam(model_outputs, 0),
             return_timestamps=return_timestamps,
             return_language=return_language,
-            time_precision=time_precision,
         )
-        return {"text": text, **optional}
+
+        if not model_outputs:
+            return best_result
+
+        num_beams = model_outputs[0]["tokens"].shape[0]
+        if num_beams == 1:
+            return best_result
+
+        beams = [best_result]
+        for beam_idx in range(1, num_beams):
+            beams.append(
+                self._decode_model_outputs(
+                    self._select_beam(model_outputs, beam_idx),
+                    return_timestamps=return_timestamps,
+                    return_language=return_language,
+                )
+            )
+
+        return {**best_result, "beams": beams}
 
     def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False, num_beams=1):
         # We need to keep track of some additional input arguments for post-processing so need to forward these on after running generation
@@ -411,9 +457,10 @@ class FlaxWhisperPipline:
         pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps, num_beams=num_beams)[
             :input_batch_size
         ]
+        if pred_ids.ndim == 2:
+            pred_ids = pred_ids[:, None, :]
 
-        # tokenizer's decode method expects an extra dim - we insert it here for convenience
-        out = {"tokens": pred_ids[:, None, :]}
+        out = {"tokens": pred_ids}
 
         stride = model_inputs.pop("stride", None)
         if stride is not None:
@@ -480,11 +527,14 @@ class FlaxWhisperPipline:
                 containing the transcription segments chunked by their utterance-level timestamps.
             num_beams (`int`, *optional*, defaults to 1):
                 Number of beams for beam search. 1 means no beam search (greedy decoding). Values greater than 1
-                enable beam search, which can improve transcription quality at the cost of slower inference.
+                enable beam search, which can improve transcription quality at the cost of slower inference. When
+                `num_beams > 1`, the pipeline returns the top beam in `"text"` and all beam hypotheses in `"beams"`.
 
         Return:
             `Dict`: A dictionary with the following keys:
                 - **text** (`str` ) -- The recognised text.
+                - **beams** (*optional*, `List[Dict]`) -- Present when `num_beams > 1`. Each item contains one decoded
+                    beam hypothesis in rank order, using the same output structure as the top-level result.
                 - **chunks** (*optional(, `List[Dict]`)
                     When using `return_timestamps`, the `chunks` will become a list containing all the various text
                     chunks identified by the model, *e.g.* `[{"text": "hi ", "timestamps": (0.5,0.9), {"text":
